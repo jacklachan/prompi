@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PromptPi dry run</title>
+<style>
+  :root { --bg:#0f1117; --card:#1a1d27; --fg:#e8e8ef; --mut:#8b90a3; --accent:#5b8cff; --rec:#ff5b6e; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:760px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { color:var(--mut); margin:0 0 24px; }
+  .card { background:var(--card); border-radius:12px; padding:16px; margin:16px 0; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); margin:0 0 8px; }
+  textarea { width:100%; min-height:90px; resize:vertical; background:#0c0e14; color:var(--fg);
+             border:1px solid #2a2e3c; border-radius:8px; padding:10px; font:inherit; }
+  pre { white-space:pre-wrap; word-wrap:break-word; margin:0; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  button { font:inherit; border:0; border-radius:999px; padding:12px 20px; cursor:pointer;
+           background:#2a2e3c; color:var(--fg); }
+  button.primary { background:var(--accent); color:#fff; }
+  button#talk { background:var(--accent); color:#fff; min-width:140px; }
+  button#talk.rec { background:var(--rec); }
+  button:disabled { opacity:.5; cursor:default; }
+  .status { color:var(--mut); font-size:14px; }
+  .hist { border-top:1px solid #2a2e3c; padding:10px 0; }
+  .hist .t { color:var(--mut); font-size:14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>PromptPi — dry run</h1>
+  <p class="sub">Talk. It transcribes, then a local LLM rewrites it as a structured prompt you can paste into Claude.</p>
+
+  <div class="card">
+    <div class="row">
+      <button id="talk">🎙 TALK</button>
+      <button id="redo">↺ REDO</button>
+      <span class="status" id="status">Press TALK and speak.</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Recognized speech</h2>
+    <textarea id="transcript" placeholder="Your words appear here. You can also type/edit."></textarea>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" id="send">SEND → structure it</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Structured prompt</h2>
+    <pre id="prompt" class="status">—</pre>
+    <div class="row" style="margin-top:10px">
+      <button id="copy" disabled>Copy for Claude</button>
+      <button id="download" disabled>Download .md</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>History</h2>
+    <div id="history" class="status">—</div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const setStatus = t => $("status").textContent = t;
+
+// --- Speech to text: browser Web Speech API (stands in for the ESP32 mic + cloud STT) ---
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, recording = false;
+if (!SR) setStatus("This browser has no speech recognition — use Chrome/Edge, or just type.");
+
+function startRec() {
+  rec = new SR();
+  rec.lang = "en-US"; rec.interimResults = true; rec.continuous = true;
+  let finalText = $("transcript").value;
+  rec.onresult = e => {
+    let interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) finalText += r[0].transcript + " ";
+      else interim += r[0].transcript;
+    }
+    $("transcript").value = (finalText + interim).trim();
+  };
+  rec.onerror = e => setStatus("Mic error: " + e.error);
+  rec.onend = () => { if (recording) rec.start(); };  // keep going until TALK pressed again
+  rec.start();
+  recording = true;
+  $("talk").classList.add("rec"); $("talk").textContent = "⏹ STOP";
+  setStatus("Listening…");
+}
+function stopRec() {
+  recording = false;
+  if (rec) rec.stop();
+  $("talk").classList.remove("rec"); $("talk").textContent = "🎙 TALK";
+  setStatus("Stopped. Press SEND to structure it.");
+}
+
+$("talk").onclick = () => { if (!SR) return; recording ? stopRec() : startRec(); };
+$("redo").onclick = () => { stopRec(); $("transcript").value = ""; $("prompt").textContent = "—";
+                            $("copy").disabled = true; setStatus("Cleared. Press TALK."); };
+
+// --- Structure: POST transcript to the Flask server ---
+$("send").onclick = async () => {
+  stopRec();
+  const transcript = $("transcript").value.trim();
+  if (!transcript) { setStatus("Nothing to send — speak or type first."); return; }
+  $("send").disabled = true; setStatus("Asking the local LLM…");
+  try {
+    const r = await fetch("/structure", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({transcript})
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.status);
+    $("prompt").textContent = data.prompt;
+    $("copy").disabled = false; $("download").disabled = false;
+    setStatus("Done."); loadHistory();
+  } catch (e) { setStatus("Error: " + e.message); }
+  finally { $("send").disabled = false; }
+};
+
+$("copy").onclick = () => navigator.clipboard.writeText($("prompt").textContent)
+  .then(() => setStatus("Copied — paste it into Claude."));
+
+$("download").onclick = () => {
+  const blob = new Blob([$("prompt").textContent], {type: "text/markdown"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "prompt-" + new Date().toISOString().slice(0,19).replace(/[:T]/g,"-") + ".md";
+  a.click(); URL.revokeObjectURL(a.href);
+  setStatus("Downloaded " + a.download);
+};
+
+async function loadHistory() {
+  try {
+    const h = await (await fetch("/history")).json();
+    $("history").innerHTML = h.length
+      ? h.slice().reverse().map(x => `<div class="hist"><div class="t">🗣 ${x.transcript}</div></div>`).join("")
+      : "—";
+  } catch {}
+}
+loadHistory();
+</script>
+</body>
+</html>
